@@ -11,7 +11,54 @@ API_HOST="https://api.trae.com.cn"
 mkdir -p "$AUTH_DIR"
 
 MACHINE_ID="$(openssl rand -hex 16 2>/dev/null || python3 -c 'import secrets;print(secrets.token_hex(16))')"
-DEVICE_ID="$(openssl rand -hex 16 2>/dev/null || python3 -c 'import secrets;print(secrets.token_hex(16))')"
+
+# device_id 必须是官方客户端 AHA 注册过的真实设备 ID。
+# checkin_credits/claim 会校验设备：未注册的随机 ID 会收到 9074（文案为
+# “当前参与用户太多，请稍后再试”），服务端不执行签到。
+# 优先级：环境变量 TRAE_DEVICE_ID > 本机官方客户端日志 > 随机（仅兜底，签到大概率失败）。
+DEVICE_ID="$(TRAE_DEVICE_ID="${TRAE_DEVICE_ID:-}" python3 - <<'PYEOF'
+import glob, os, re, sys
+
+env = os.environ.get("TRAE_DEVICE_ID", "").strip()
+if env:
+    print(env); sys.exit(0)
+
+home = os.path.expanduser("~")
+appdata = os.environ.get("APPDATA", "")
+xcfg = os.environ.get("XDG_CONFIG_HOME", "")
+roots = []
+for name in ("Trae CN", "TRAE SOLO CN", "TRAE CN"):
+    roots += [
+        os.path.join(home, "Library", "Application Support", name),          # macOS
+        os.path.join(appdata, name) if appdata else "",                       # Windows
+        os.path.join(xcfg or os.path.join(home, ".config"), name),            # Linux
+    ]
+
+pat = re.compile(r"device_id[:\s]+(\d{10,})")
+votes = {}
+for root in roots:
+    if not root:
+        continue
+    for f in glob.glob(os.path.join(root, "logs", "aha_log", "aha_electron_*.log")):
+        try:
+            txt = open(f, encoding="utf-8", errors="replace").read()
+        except OSError:
+            continue
+        for m in pat.finditer(txt):
+            votes[m.group(1)] = votes.get(m.group(1), 0) + 1
+
+if votes:
+    print(max(votes, key=votes.get))
+else:
+    import secrets
+    sys.stderr.write(
+        "[!] 未从官方客户端日志找到已注册设备 ID（请先安装并至少启动过一次 Trae CN），\n"
+        "    已回退为随机 ID——签到接口很可能返回 9074。\n"
+        "    可手动指定：TRAE_DEVICE_ID=<真实设备ID> ./login.sh\n")
+    print(secrets.token_hex(16))
+PYEOF
+)"
+echo "[*] 使用 device_id: $DEVICE_ID"
 
 echo "============================================================"
 echo "  TRAE SOLO 登录 - 纯签到版"
@@ -50,18 +97,68 @@ print("https://www.trae.cn/authorization?" + urllib.parse.urlencode(params))
 PYEOF
 )"
 
+# 跨平台读取剪贴板：macOS pbpaste / Windows PowerShell / Linux xclip/xsel/wl-paste
+clip_read() {
+    if command -v pbpaste >/dev/null 2>&1; then
+        pbpaste 2>/dev/null
+    elif command -v powershell >/dev/null 2>&1; then
+        powershell -NoProfile -Command "Get-Clipboard -Raw" 2>/dev/null
+    elif command -v xclip >/dev/null 2>&1; then
+        xclip -selection clipboard -o 2>/dev/null
+    elif command -v xsel >/dev/null 2>&1; then
+        xsel --clipboard --output 2>/dev/null
+    elif command -v wl-paste >/dev/null 2>&1; then
+        wl-paste --no-newline 2>/dev/null
+    fi
+}
+
+# 记录剪贴板基线，轮询时只接受「新出现」的回调 URL，
+# 这样连续添加多账号时不会误用上一次残留的回调链接。
+clip_baseline="$(clip_read)"
+
 echo "请在浏览器打开："
 echo ""
 echo "  $LOGIN_URL"
 echo ""
-
-read -rp "登录完成后，请粘贴浏览器地址栏的完整回调链接（不回显）: " -s callback_url || true
+echo "登录后浏览器会跳到打不开的 127.0.0.1 页面，"
+echo "复制浏览器地址栏的完整链接，脚本会自动检测剪贴板。"
 echo ""
+
+callback_url="${1:-}"
 if [[ -z "$callback_url" ]]; then
-    echo "未输入回调链接，已取消"
+    if [[ -z "$(clip_read 2>/dev/null)" ]] && ! command -v pbpaste >/dev/null 2>&1 \
+       && ! command -v powershell >/dev/null 2>&1 \
+       && ! command -v xclip >/dev/null 2>&1 \
+       && ! command -v xsel >/dev/null 2>&1 \
+       && ! command -v wl-paste >/dev/null 2>&1; then
+        # 无任何剪贴板工具，回退到交互输入
+        read -rp "请粘贴回调链接: " callback_url || true
+    else
+        echo "[*] 等待剪贴板出现回调链接..." >&2
+        spin='/-|\\'
+        i=0
+        while true; do
+            clip="$(clip_read)"
+            clip="${clip//[[:space:]]/}"
+            # 必须是回调 URL，且与基线不同（防止误用上次的链接）
+            if { [[ "$clip" == *127.0.0.1* ]] || [[ "$clip" == *authorize*code=* ]]; } \
+               && [[ "$clip" != "$clip_baseline" ]]; then
+                callback_url="$clip"
+                break
+            fi
+            printf "\r[%c] 等待回调链接（复制后自动继续）..." "${spin:$((i % 4)):1}" >&2
+            i=$((i + 1))
+            sleep 1
+        done
+        echo "" >&2
+    fi
+fi
+if [[ -z "$callback_url" ]]; then
+    echo "未获取到回调链接，已取消" >&2
     exit 1
 fi
 
+echo "[*] 已收到回调链接（长度 ${#callback_url}），开始换取 token..." >&2
 RESULT=$(CLIENT_ID="$CLIENT_ID" API_HOST="$API_HOST" APP_VERSION="$APP_VERSION" \
 MACHINE_ID="$MACHINE_ID" DEVICE_ID="$DEVICE_ID" CALLBACK_URL="$callback_url" python3 - <<'PYEOF'
 import json, os, sys, time, urllib.parse, urllib.request, urllib.error
@@ -135,7 +232,7 @@ if refresh_token:
         expires_at //= 1000
     if expires_at <= time.time():
         expires_at = int(time.time()) + int(result.get("TokenExpireDuration") or 1209600)
-    print(f"[*] ExchangeToken 成功")
+    print("[*] ExchangeToken 成功", file=sys.stderr)
 else:
     token = jwt_token
     expires_at = int(user_jwt.get("TokenExpireAt") or 0)
@@ -144,7 +241,7 @@ else:
     if not token:
         print("[!] 回调链接缺少 refreshToken", file=sys.stderr)
         sys.exit(1)
-    print("[*] 使用 userJwt 的 Token 兜底")
+    print("[*] 使用 userJwt 的 Token 兜底", file=sys.stderr)
 
 try:
     ui = http_post_json(API_HOST + "/cloudide/api/v3/trae/GetUserInfo",
@@ -186,10 +283,10 @@ EXPIRES_AT=$(echo "$CRED" | python3 -c "import json,sys; print(json.load(sys.std
 
 AUTH_FILE="$AUTH_DIR/trae-${ACCT_UID}.json"
 if [[ -f "$AUTH_FILE" ]]; then
-    echo "账号已存在（uid=$ACCT_UID），将覆盖更新凭证"
+    echo "账号已存在（uid=${ACCT_UID}），将覆盖更新凭证"
     ACTION="覆盖"
 else
-    echo "新账号（uid=$ACCT_UID），新增 auth 文件"
+    echo "新账号（uid=${ACCT_UID}，新增 auth 文件"
     ACTION="新增"
 fi
 
@@ -215,14 +312,18 @@ print(f"已保存（{os.environ['ACTION']}）: {os.environ['AUTH_FILE']}")
 PYEOF
 
 # 自动签到 + 查积分
-TOKEN="$TOKEN" DEVICE_ID="$DEVICE_ID" python3 - <<'PYEOF'
-import json, os, urllib.request
+TOKEN="$TOKEN" DEVICE_ID="$DEVICE_ID" APP_VERSION="$APP_VERSION" python3 - <<'PYEOF'
+import json, os, time, urllib.request
 UG = "https://api.trae.cn"
 HDRS = {
     "Content-Type": "application/json",
     "Authorization": "Cloud-IDE-JWT " + os.environ["TOKEN"],
     "X-User-Region": "CN",
-    "X-Device-Id": os.environ["DEVICE_ID"],
+    "x-device-id": os.environ["DEVICE_ID"],
+    "x-device-brand": "PC",
+    "x-device-type": "PC",
+    "x-os-version": "1.0",
+    "x-app-version": os.environ["APP_VERSION"],
 }
 def post(path, body=b"{}"):
     req = urllib.request.Request(UG + path, method="POST", data=body, headers=HDRS)
@@ -230,11 +331,25 @@ def post(path, body=b"{}"):
         return json.loads(r.read().decode() or "{}")
 try:
     st = post("/trae/api/v2/ug/checkin_credits/status")
-    if not st.get("checked_in") and st.get("enable"):
-        r = post("/trae/api/v2/ug/checkin_credits/claim")
-        print(f"签到: {r.get('message', 'success')}")
+    if st.get("checked_in"):
+        print("签到: 今日已签到")
+    elif not st.get("enable"):
+        print("签到: 活动未启用")
     else:
-        print(f"签到状态: checked_in={st.get('checked_in')} enable={st.get('enable')}")
+        # body 必须带 req_source=1（官方客户端固定值）；空 body 服务端不执行任何操作
+        r = post("/trae/api/v2/ug/checkin_credits/claim", b'{"req_source":1}')
+        code = r.get("code")
+        # 9074（设备校验失败/繁忙文案）短暂重试一次
+        if code == 9074:
+            time.sleep(2)
+            r = post("/trae/api/v2/ug/checkin_credits/claim", b'{"req_source":1}')
+            code = r.get("code")
+        if code not in (0, None):
+            print(f"签到: 失败 code={code} {r.get('message','')}")
+        else:
+            # code=0 也必须回查，空操作同样返回 code=0
+            v = post("/trae/api/v2/ug/checkin_credits/status")
+            print("签到: 成功" if v.get("checked_in") else "签到: 服务端已受理但状态未翻转，请稍后重试")
 except Exception as e:
     print(f"签到: {e}")
 try:

@@ -39,7 +39,7 @@ func main() {
 	up := upstream.New()
 
 	var rows []row
-	okN, alreadyN, failN, disabledN := 0, 0, 0, 0
+	okN, alreadyN, failN, disabledN, skipN := 0, 0, 0, 0, 0
 
 	for _, f := range files {
 		r := row{file: filepath.Base(f)}
@@ -97,9 +97,16 @@ func main() {
 			disabledN++
 		default:
 			if err := up.CheckinClaim(a); err != nil {
-				r.status = "FAIL"
-				r.detail = short(err.Error())
-				failN++
+				msg := err.Error()
+				if strings.Contains(msg, "此设备今日已签到") {
+					r.status = "SKIP"
+					r.detail = "设备今日已用于其他账号"
+					skipN++
+				} else {
+					r.status = "FAIL"
+					r.detail = short(msg)
+					failN++
+				}
 			} else {
 				r.status = "✅ OK"
 				okN++
@@ -128,7 +135,7 @@ func main() {
 	}
 	fmt.Println("└──────────────────────────────────────┴───────────────┴──────────────┴──────────┴──────────────────────────────────────┘")
 	fmt.Println()
-	fmt.Printf("📊 总计=%d  签到成功=%d  已签=%d  禁用=%d  失败=%d\n", len(rows), okN, alreadyN, disabledN, failN)
+	fmt.Printf("📊 总计=%d  签到成功=%d  已签=%d  禁用=%d  跳过=%d  失败=%d\n", len(rows), okN, alreadyN, disabledN, skipN, failN)
 }
 
 func isAlready(msg string) bool {
@@ -139,16 +146,18 @@ func isAlready(msg string) bool {
 }
 
 func trunc(s string, n int) string {
-	if len(s) > n {
-		return s[:n]
+	r := []rune(s)
+	if len(r) > n {
+		return string(r[:n])
 	}
 	return s
 }
 
 func short(s string) string {
 	s = strings.ReplaceAll(s, "\n", " ")
-	if len(s) > 60 {
-		return s[:60]
+	r := []rune(s)
+	if len(r) > 60 {
+		return string(r[:60])
 	}
 	return s
 }
