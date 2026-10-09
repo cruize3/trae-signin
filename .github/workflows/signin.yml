@@ -6,6 +6,9 @@ on:
     - cron: '12 1 * * *'
   workflow_dispatch: # 支持手动触发
 
+permissions:
+  secrets: write  # 允许回写刷新后的凭证
+
 jobs:
   signin:
     runs-on: ubuntu-latest
@@ -24,14 +27,27 @@ jobs:
       - name: 生成凭证文件
         run: |
           mkdir -p auths
-          # 账号1
           echo '${{ secrets.TRAE_AUTH_1 }}' > auths/trae-1.json
-          # 账号2
           echo '${{ secrets.TRAE_AUTH_2 }}' > auths/trae-2.json
-          # 如需更多账号，添加更多 TRAE_AUTH_N
 
       - name: 执行签到
         run: ./signin_bin auths
+
+      - name: 回写刷新后的凭证到 Secrets
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # 签到程序会把刷新后的 token 写回 auth 文件
+          # 这里读取并更新到 GitHub Secrets，下次 CI 运行就能用新的 token
+          if [ -f auths/trae-1.json ]; then
+            gh secret set TRAE_AUTH_1 < auths/trae-1.json
+            echo "✅ TRAE_AUTH_1 已更新"
+          fi
+          if [ -f auths/trae-2.json ]; then
+            gh secret set TRAE_AUTH_2 < auths/trae-2.json
+            echo "✅ TRAE_AUTH_2 已更新"
+          fi
 
       - name: 清理凭证
         if: always()
